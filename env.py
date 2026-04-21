@@ -529,7 +529,7 @@ class UAVNavigationEnv(gym.Env):
 
             # ===== 从数据库加载地图 =====
             cursor = self.db_conn.cursor()
-            cursor.execute("SELECT image_data FROM image_maps WHERE id = %s", (int(selected_id),))
+            cursor.execute("SELECT image_data FROM image_maps1 WHERE id = %s", (int(selected_id),))
             row = cursor.fetchone()
             cursor.close()
 
