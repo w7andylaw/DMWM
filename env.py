@@ -403,7 +403,7 @@ class UAVNavigationEnv(gym.Env):
                 self.db_conn = mysql.connector.connect(**self.db_config)
                 print("[UAVEnv] DB Connected.")
                 cur = self.db_conn.cursor()
-                cur.execute("SELECT id FROM image_maps1")
+                cur.execute("SELECT id FROM image_maps2")
                 all_ids = [x[0] for x in cur.fetchall()]
                 cur.close()
 
@@ -518,7 +518,7 @@ class UAVNavigationEnv(gym.Env):
         if not self.db_conn:
             raise ConnectionError("Database is not connected! Check your DB config.")
         if not self.map_ids:
-            raise ValueError("No map IDs found in the database table 'image_maps1'.")
+            raise ValueError("No map IDs found in the database table.")
 
         try:
             start_time = time.time()
@@ -541,7 +541,7 @@ class UAVNavigationEnv(gym.Env):
 
             # ===== 从数据库加载地图 =====
             cursor = self.db_conn.cursor()
-            cursor.execute("SELECT image_data FROM image_maps1 WHERE id = %s", (int(selected_id),))
+            cursor.execute("SELECT image_data FROM image_maps2 WHERE id = %s", (int(selected_id),))
             row = cursor.fetchone()
             cursor.close()
 
