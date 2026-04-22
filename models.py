@@ -769,109 +769,136 @@ class RewardModel(nn.Module):
 
 
 # ============================================================================
-#  [公式 30] ValueModel: V_ψ(h, z, m)
+#  [D3QN 替换] QNetwork: Q_θ(h, z, m, ·) — Dueling Double DQN
+# ----------------------------------------------------------------------------
+#  原 ValueModel (V_ψ, 公式 30) + ActorModel (π_η, 公式 29) 已被下方 Q 网络
+#  取代. 论文公式 31-34 的 λ-return + actor/value 更新对应替换为:
+#      y_t = r̂_t + γ · ĉ_t · Q_target(s_{t+1}, argmax_a Q_online(s_{t+1}, a))
+#      L_Q = Huber(Q_online(s_t, a_t), y_t)
+#  其余 WM 组件 (TransitionModel / ObservationModel / RewardModel /
+#  ContinuationModel / MapEncoder / MapTransitionModel / ObstacleForecaster /
+#  DifferentiableMapUpdater / Encoder) 与论文公式 9-25, 35-43 完全保留.
 # ============================================================================
 
-class ValueModel(nn.Module):
+class QNetwork(nn.Module):
     """
-    [论文公式 30] 价值函数:
-        V_ψ(h_t, z_t, m_t)
+    Dueling Q-Network: Q(h, z, m, a) for a ∈ {0, ..., action_size-1}.
 
-    [修改] 加入 map_embedding_size.
+    输入接口与原 ValueModel 完全一致:
+        forward(belief, state, map_embedding=None) → (B, action_size)
+
+    Dueling 头:
+        shared MLP → [V(s) ∈ R, A(s, ·) ∈ R^|A|]
+        Q(s, a) = V(s) + (A(s, a) - mean_a A(s, ·))
     """
 
-    def __init__(self, belief_size, state_size, hidden_size,
-                 map_embedding_size=256, activation_function='relu'):
+    def __init__(self, belief_size, state_size, hidden_size, action_size,
+                 map_embedding_size=256, activation_function='elu'):
         super().__init__()
         self.act_fn = getattr(F, activation_function)
         input_size = belief_size + state_size + map_embedding_size
+
+        # 共享 trunk — 与原 ValueModel 一致的 3 层 FC
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fc3 = nn.Linear(hidden_size, hidden_size)
-        self.fc4 = nn.Linear(hidden_size, 1)
-        self.component_modules = [self.fc1, self.fc2, self.fc3, self.fc4]
-        self._map_emb_size = map_embedding_size
 
-    def forward(self, belief, state, map_embedding=None):
-        if map_embedding is not None:
-            x = torch.cat([belief, state, map_embedding], dim=1)
-        else:
-            B = belief.size(0)
-            x = torch.cat([belief, state, torch.zeros(B, self._map_emb_size, device=belief.device)], dim=1)
-        hidden = self.act_fn(self.fc1(x))
-        hidden = self.act_fn(self.fc2(hidden))
-        hidden = self.act_fn(self.fc3(hidden))
-        return self.fc4(hidden).squeeze(dim=1)
+        # Dueling heads
+        self.value_head = nn.Linear(hidden_size, 1)
+        self.adv_head = nn.Linear(hidden_size, action_size)
 
-
-# ============================================================================
-#  [公式 29] ActorModel: π_η(a | h, z, m)
-# ============================================================================
-
-class ActorModel(nn.Module):
-    """
-    [论文公式 29, Section II-B] 离散动作策略 (8 个飞行方向).
-
-    [修改] 加入 map_embedding_size, 拼接 belief + state + map_embedding.
-
-    get_action 返回 one-hot (B, action_size).
-    训练时 Straight-Through Gumbel-Softmax; 测试时 argmax.
-    """
-
-    def __init__(
-            self,
-            belief_size,
-            state_size,
-            hidden_size,
-            action_size,
-            map_embedding_size=256,
-            dist='categorical',
-            activation_function='elu',
-            min_std=1e-4,
-            init_std=5,
-            mean_scale=5,
-    ):
-        super().__init__()
-        self.act_fn = getattr(F, activation_function)
-        input_size = belief_size + state_size + map_embedding_size
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, hidden_size)
-        self.fc4 = nn.Linear(hidden_size, hidden_size)
-        self.fc5 = nn.Linear(hidden_size, action_size)
-        self.component_modules = [self.fc1, self.fc2, self.fc3, self.fc4, self.fc5]
+        self.component_modules = [
+            self.fc1, self.fc2, self.fc3, self.value_head, self.adv_head,
+        ]
         self._action_size = action_size
         self._map_emb_size = map_embedding_size
 
     def forward(self, belief, state, map_embedding=None):
-        """返回 logits (B, action_size)."""
         if map_embedding is not None:
             x = torch.cat([belief, state, map_embedding], dim=1)
         else:
             B = belief.size(0)
-            x = torch.cat([belief, state, torch.zeros(B, self._map_emb_size, device=belief.device)], dim=1)
+            x = torch.cat(
+                [belief, state,
+                 torch.zeros(B, self._map_emb_size, device=belief.device)],
+                dim=1,
+            )
         h = self.act_fn(self.fc1(x))
         h = self.act_fn(self.fc2(h))
         h = self.act_fn(self.fc3(h))
-        h = self.act_fn(self.fc4(h))
-        return self.fc5(h)
 
-    def get_action(self, belief, state, map_embedding=None, det=False):
-        """
-        返回 one-hot (B, action_size).
-        det=True:  argmax
-        det=False: Straight-Through Gumbel-Softmax
-        """
-        logits = self.forward(belief, state, map_embedding)
-        if det:
-            idx = torch.argmax(logits, dim=-1)
-            return F.one_hot(idx, num_classes=self._action_size).float()
-        else:
-            return F.gumbel_softmax(logits, tau=1.0, hard=True)
+        V = self.value_head(h)                              # (B, 1)
+        A = self.adv_head(h)                                # (B, |A|)
+        Q = V + (A - A.mean(dim=-1, keepdim=True))          # (B, |A|)
+        return Q
 
-    def get_dist(self, belief, state, map_embedding=None):
-        logits = self.forward(belief, state, map_embedding)
-        return torch.distributions.Categorical(logits=logits)
+
+class QPolicy:
+    """
+    包装 QNetwork 为原 ActorModel 兼容接口.
+
+    API 对齐:
+        get_action(belief, state, map_embedding=None, det=False) → one-hot (B, |A|)
+
+    这样 imagine_ahead 和 update_belief_and_act 中的
+        action = planner.get_action(...)
+    调用语义完全不变, 实现零侵入替换.
+
+    参数:
+        q_net:            QNetwork 实例
+        action_size:      动作数 (= 8)
+        default_epsilon:  非确定性 (det=False) 时的默认 ε.
+                          在 imagine_ahead 中作为想象探索 ε (恒定, 如 0.3).
+                          在 env 采集中通过 epsilon= 参数覆盖 (按 episode 衰减).
+    """
+
+    def __init__(self, q_net, action_size, default_epsilon=0.0):
+        self.q_net = q_net
+        self.action_size = action_size
+        self.default_epsilon = default_epsilon
+
+    def set_epsilon(self, eps):
+        """外部可动态设置 ε (例如按 episode 衰减)."""
+        self.default_epsilon = float(eps)
+
+    def get_action(self, belief, state, map_embedding=None, det=False, epsilon=None):
+        """
+        返回 one-hot 动作 (B, action_size), 与原 ActorModel.get_action 接口一致.
+        不回传梯度 — DQN 不需要对动作选择微分.
+
+        Args:
+            belief, state, map_embedding:  与原 ActorModel 相同
+            det:       True → 纯 argmax (测试模式)
+            epsilon:   覆盖 default_epsilon (可选)
+        """
+        with torch.no_grad():
+            q = self.q_net(belief, state, map_embedding)    # (B, |A|)
+            B = q.size(0)
+            greedy = q.argmax(dim=-1)
+
+            eps = 0.0 if det else (epsilon if epsilon is not None else self.default_epsilon)
+            if eps <= 0.0:
+                idx = greedy
+            else:
+                rand = torch.randint(0, self.action_size, (B,), device=q.device)
+                mask = torch.rand(B, device=q.device) < eps
+                idx = torch.where(mask, rand, greedy)
+
+            return F.one_hot(idx, num_classes=self.action_size).float()
+
+
+def sync_target(target_net: nn.Module, online_net: nn.Module, tau: float = 1.0):
+    """
+    同步 target 网络.
+        tau = 1.0  — hard copy (标准 DQN)
+        tau < 1.0  — soft Polyak update (θ_tgt ← τ·θ + (1-τ)·θ_tgt)
+    """
+    if tau >= 1.0:
+        target_net.load_state_dict(online_net.state_dict())
+    else:
+        with torch.no_grad():
+            for p_tgt, p in zip(target_net.parameters(), online_net.parameters()):
+                p_tgt.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
 
 # ============================================================================

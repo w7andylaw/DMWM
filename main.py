@@ -1,18 +1,25 @@
 """
-main.py — 完整复现论文训练流程
+main_wm_d3qn.py — WM + D3QN  (actor-critic 替换为 Dueling Double DQN)
+===================================================================
+相对于 main.py 的唯一差异: 控制器从 ActorModel + ValueModel (公式 29-30)
+换为 Dueling Double DQN, 在想象中用 1-step TD 训练.
 
-修改对照:
-──────────────────────────────────────────────────────────────
-[1]  新增模型: MapEncoder, MapTransitionModel, ObstacleForecaster,
-     ContinuationModel, DifferentiableMapUpdater
-[2]  TransitionModel 接收 map_embeddings (公式 14)
-[3]  Actor/Value/Reward 接收 map_embedding (公式 22, 29, 30)
-[4]  ObservationModel 接收 map_embedding (公式 21)
-[5]  完整损失函数 L_WM (公式 35-43, 9 项)
-[6]  imagine_ahead 传播 map_embedding (公式 17-20)
-[7]  lambda_return 使用 continuation (公式 31-32)
-[8]  observation_loss 权重修正 (从 0.001 → λ_img)
-──────────────────────────────────────────────────────────────
+不变的部分:
+  - 完整世界模型: encoder + RSSM + obs/reward/continuation decoder
+  - 语义地图模块: MapEncoder, MapTransitionModel, DifferentiableMapUpdater
+  - 障碍预测: ObstacleForecaster (公式 24-25)
+  - L_WM 的 9 项损失 (公式 35-43) 完全保留
+  - imagine_ahead 想象 rollout (公式 17-20)
+  - 风险项 χ_t (公式 28) 仍然注入想象奖励 → D3QN 的 TD 目标是 risk-aware
+
+改动:
+  - ActorModel / ValueModel → QNetwork + target QNetwork (Dueling)
+  - λ-return (公式 31-32) → Double DQN 1-step TD:
+        y_t = r̂_t + γ · ĉ_t · Q_target(s_{t+1}, argmax_a Q_online(s_{t+1}, a))
+        L_Q = Huber(Q_online(s_t, a_t), y_t)
+  - planner = QPolicy(q_net) 接口与 ActorModel 一致 → imagine_ahead
+    和 update_belief_and_act 零修改
+  - 训练损失从 11 项降到 10 项 (actor_loss + value_loss 合并为 q_loss)
 """
 
 import argparse
@@ -37,10 +44,12 @@ from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS, GYM_ENVS, Env, EnvBatcher
 from memory import ExperienceReplay
 from models import (
-    ActorModel, Encoder, ObservationModel, RewardModel, TransitionModel,
-    ValueModel, bottle, UAVHybridEncoder, SemanticFeatureExtractor,
+    Encoder, ObservationModel, RewardModel, TransitionModel,
+    bottle, UAVHybridEncoder, SemanticFeatureExtractor,
     MapEncoder, MapTransitionModel, ObstacleForecaster, ContinuationModel,
     DifferentiableMapUpdater,
+    # [D3QN 替换] QNetwork + QPolicy 已并入 models.py, 替换原 ActorModel / ValueModel
+    QNetwork, QPolicy, sync_target,
 )
 from utils import FreezeParameters, imagine_ahead, lambda_return, lineplot, write_video
 
@@ -146,6 +155,24 @@ parser.add_argument('--forecast-horizon', type=int, default=5, help='Obstacle fo
 parser.add_argument('--encode-batch', type=int, default=100, metavar='EB',
                     help='Mini-batch size for encoder forward')
 parser.add_argument('--eval-steps', type=int, default=1000, metavar='ES')
+
+# ============================================================================
+#  [D3QN 替换] D3QN 专属超参数
+# ============================================================================
+parser.add_argument('--q-learning-rate', type=float, default=1e-4, metavar='αQ',
+                    help='Q-network 学习率')
+parser.add_argument('--q-target-update', type=int, default=100,
+                    help='Target Q 网络硬同步周期 (单位: 梯度步)')
+parser.add_argument('--q-target-tau', type=float, default=1.0,
+                    help='1.0 → hard copy; <1.0 → Polyak soft update')
+parser.add_argument('--q-epsilon-imag', type=float, default=0.3,
+                    help='想象 rollout 中的 ε (固定, 为 Q 提供探索性轨迹)')
+parser.add_argument('--q-epsilon-start', type=float, default=1.0,
+                    help='环境采集的 ε 起始值')
+parser.add_argument('--q-epsilon-end', type=float, default=0.05,
+                    help='环境采集的 ε 终止值')
+parser.add_argument('--q-epsilon-decay-eps', type=int, default=300,
+                    help='线性衰减 (episodes) — q_epsilon_start → q_epsilon_end')
 args = parser.parse_args()
 
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)
@@ -185,7 +212,8 @@ metrics = {
     'test_episodes': [], 'test_rewards': [], 'test_avg_rewards': [],
     'observation_loss': [], 'reward_loss': [], 'kl_loss': [],
     'continuation_loss': [], 'map_loss': [], 'occ_loss': [], 'flow_loss': [],
-    'actor_loss': [], 'value_loss': [],
+    # [D3QN 替换] actor_loss + value_loss → q_loss
+    'q_loss': [],
 }
 
 summary_name = results_dir + "/{}_{}_log"
@@ -294,19 +322,38 @@ else:
                       args.cnn_activation_function).to(device=args.device)
     semantic_extractor = None
 
-# --- ActorModel (公式 29) ---
-actor_model = ActorModel(
-    args.belief_size, args.state_size, args.hidden_size, env.action_size,
+# ============================================================================
+#  [D3QN 替换] ActorModel + ValueModel → QNetwork + target_q_net + QPolicy
+# ----------------------------------------------------------------------------
+#  - QNetwork: Q_θ(h, z, m, ·) ∈ R^|A|, Dueling 头 (V + A - mean A)
+#  - target_q_net: 同架构冻结副本, 用于 Double DQN 目标估值 & 稳定训练
+#  - QPolicy: 包装 q_net 为 ActorModel 兼容接口, 供 imagine_ahead 和
+#    update_belief_and_act 直接复用, 零侵入
+# ============================================================================
+q_net = QNetwork(
+    belief_size=args.belief_size,
+    state_size=args.state_size,
+    hidden_size=args.hidden_size,
+    action_size=env.action_size,
     map_embedding_size=args.map_embedding_size,
     activation_function=args.dense_activation_function,
 ).to(device=args.device)
 
-# --- ValueModel (公式 30) ---
-value_model = ValueModel(
-    args.belief_size, args.state_size, args.hidden_size,
+target_q_net = QNetwork(
+    belief_size=args.belief_size,
+    state_size=args.state_size,
+    hidden_size=args.hidden_size,
+    action_size=env.action_size,
     map_embedding_size=args.map_embedding_size,
     activation_function=args.dense_activation_function,
 ).to(device=args.device)
+target_q_net.load_state_dict(q_net.state_dict())
+for _p in target_q_net.parameters():
+    _p.requires_grad = False
+
+# QPolicy: 接口与 ActorModel 一致 — get_action(belief, state, map_emb, det=?) → one-hot
+q_policy = QPolicy(q_net, env.action_size,
+                   default_epsilon=args.q_epsilon_imag)
 
 # ============================================================================
 #  Optimizers
@@ -333,16 +380,14 @@ model_optimizer = optim.Adam(
     lr=0 if args.learning_rate_schedule != 0 else args.model_learning_rate,
     eps=args.adam_epsilon,
 )
-actor_optimizer = optim.Adam(
-    actor_model.parameters(),
-    lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate,
+# [D3QN 替换] actor_optimizer + value_optimizer → q_optimizer
+q_optimizer = optim.Adam(
+    q_net.parameters(),
+    lr=0 if args.learning_rate_schedule != 0 else args.q_learning_rate,
     eps=args.adam_epsilon,
 )
-value_optimizer = optim.Adam(
-    value_model.parameters(),
-    lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate,
-    eps=args.adam_epsilon,
-)
+# 全局 Q 梯度步计数 — 用于 target 同步周期
+q_update_count = 0
 
 # Load pretrained models
 if args.models != '' and os.path.exists(args.models):
@@ -352,9 +397,18 @@ if args.models != '' and os.path.exists(args.models):
     observation_model.load_state_dict(model_dicts['observation_model'])
     reward_model.load_state_dict(model_dicts['reward_model'])
     encoder.load_state_dict(model_dicts['encoder'])
-    actor_model.load_state_dict(model_dicts['actor_model'])
-    value_model.load_state_dict(model_dicts['value_model'])
+    # [D3QN 替换] 加载 Q 网络 (向后兼容: 若 ckpt 无 q_net 键则跳过)
+    if 'q_net' in model_dicts:
+        q_net.load_state_dict(model_dicts['q_net'])
+    if 'target_q_net' in model_dicts:
+        target_q_net.load_state_dict(model_dicts['target_q_net'])
+    else:
+        target_q_net.load_state_dict(q_net.state_dict())
     model_optimizer.load_state_dict(model_dicts['model_optimizer'])
+    if 'q_optimizer' in model_dicts:
+        q_optimizer.load_state_dict(model_dicts['q_optimizer'])
+    if 'q_update_count' in model_dicts:
+        q_update_count = int(model_dicts['q_update_count'])
     if 'continuation_model' in model_dicts:
         continuation_model.load_state_dict(model_dicts['continuation_model'])
     if 'map_encoder' in model_dicts:
@@ -368,7 +422,8 @@ if args.models != '' and os.path.exists(args.models):
     if semantic_extractor is not None and 'semantic_extractor' in model_dicts:
         semantic_extractor.load_state_dict(model_dicts['semantic_extractor'])
 
-planner = actor_model
+# [D3QN 替换] planner 现在是 QPolicy — 接口与 ActorModel 一致
+planner = q_policy
 global_prior = Normal(
     torch.zeros(args.batch_size, args.state_size, device=args.device),
     torch.ones(args.batch_size, args.state_size, device=args.device),
@@ -384,9 +439,9 @@ use_amp = False
 print("AMP: OFF (forced FP32 for stability)")
 
 model_scaler = GradScaler(enabled=False)
-actor_scaler = GradScaler(enabled=False)
-value_scaler = GradScaler(enabled=False)
-print("Semantic World Model is ready.")
+# [D3QN 替换] 单一 q_scaler 取代 actor_scaler + value_scaler
+q_scaler = GradScaler(enabled=False)
+print("Semantic World Model + D3QN is ready.")
 
 
 # ============================================================================
@@ -984,137 +1039,149 @@ for episode in tqdm(
         torch.cuda.empty_cache()
 
         # ===============================================================
-        #  Actor Training (公式 33)
+        #  [D3QN 替换] Actor + Value 训练 → D3QN 想象 TD 训练
+        # ---------------------------------------------------------------
+        #  保留的论文要素:
+        #    - imagine_ahead 完整 rollout (公式 17-20)
+        #    - 奖励解码 r̂_t = reward_model(h_t, z_t, m_t) (公式 22)
+        #    - 继续概率 ĉ_t = continuation_model(h_t, z_t, m_t) (公式 22, 38)
+        #    - 风险项 χ_t = max Ô_t+k (公式 28) 注入想象奖励
+        #  替换的部分:
+        #    - 公式 29 (ActorModel) → QPolicy 的 ε-greedy argmax
+        #    - 公式 30-34 (ValueModel + λ-return + π 最大化) → Double DQN 1-step TD:
+        #        y_t = r̂_t + γ · ĉ_t · Q_target(s_{t+1}, argmax_a Q_online(s_{t+1}, a))
+        #        L_Q = Huber(Q_online(s_t, a_t), y_t)
         # ===============================================================
         with torch.no_grad():
-            actor_states = posterior_states.detach()
-            actor_beliefs = beliefs.detach()
-            # [M1 修复] actor_semantics 已移除
+            start_states = posterior_states.detach()
+            start_beliefs = beliefs.detach()
             if map_emb_for_loss is not None:
-                actor_map_emb = map_emb_for_loss.detach()
+                start_map_emb = map_emb_for_loss.detach()
             elif map_emb_for_tm is not None:
-                actor_map_emb = map_emb_for_tm.detach()
+                start_map_emb = map_emb_for_tm.detach()
             else:
-                actor_map_emb = torch.zeros(
-                    *actor_beliefs.shape[:2], args.map_embedding_size, device=args.device
+                start_map_emb = torch.zeros(
+                    *start_beliefs.shape[:2], args.map_embedding_size, device=args.device
                 )
 
-            # [方案A] 完整语义地图用于想象阶段 (公式 19-20)
+            # [方案A] 完整语义地图作为想象起点 (公式 19-20)
             if isinstance(observations, dict) and obs_sem_map is not None:
-                actor_maps = obs_sem_map[1:].to(_dev).detach()
+                start_maps = obs_sem_map[1:].to(_dev).detach()
             else:
-                actor_maps = None
+                start_maps = None
 
         # [OOM 修复] 释放世界模型前向中间变量
         del beliefs, prior_states, prior_means, prior_std_devs
         del posterior_states, posterior_means, posterior_std_devs
         del embed, sem_feat_for_tm, map_emb_for_tm, map_emb_for_loss
-        # [Q-2 修复] full_map_emb 不再需要, 释放 GPU 显存
         if full_map_emb is not None:
             del full_map_emb
         torch.cuda.empty_cache()
 
-        with FreezeParameters(model_modules):
-            # [方案A + M1] imagine_ahead: 完整地图传播, 无 semantic_state
-            imagination_traj = imagine_ahead(
-                actor_states, actor_beliefs, actor_map_emb,
-                actor_maps,
-                actor_model, transition_model, map_encoder, map_transition_model,
-                args.planning_horizon,
-            )
+        # ---------------------------------------------------------------
+        #  1) 想象 rollout — 全程 no_grad (QPolicy 内部已 no_grad; 世界模型
+        #     参数在 FreezeParameters 下不回传, 整段不产生计算图)
+        # ---------------------------------------------------------------
+        with torch.no_grad():
+            with FreezeParameters(model_modules):
+                imagination_traj = imagine_ahead(
+                    start_states, start_beliefs, start_map_emb,
+                    start_maps,
+                    q_policy,  # QPolicy: ε-greedy argmax, det=False → eps=q_epsilon_imag
+                    transition_model, map_encoder, map_transition_model,
+                    args.planning_horizon,
+                )
 
-        (imged_beliefs, imged_prior_states, imged_prior_means, imged_prior_std_devs,
-         imged_map_emb, _) = imagination_traj
+            (imged_beliefs, imged_prior_states, _imged_pm, _imged_ps,
+             imged_map_emb, imged_actions_onehot) = imagination_traj
+            # 形状:
+            #   imged_beliefs          : (H, N, belief_size)
+            #   imged_prior_states     : (H, N, state_size)
+            #   imged_map_emb          : (H, N, map_embedding_size)
+            #   imged_actions_onehot   : (H, N, action_size)
 
-        with FreezeParameters(model_modules + value_model.component_modules):
-            with autocast(enabled=use_amp):
-                H, N = imged_beliefs.shape[:2]
-                flat_ib = imged_beliefs.view(H * N, -1)
-                flat_ips = imged_prior_states.view(H * N, -1)
-                flat_ime = imged_map_emb.view(H * N, -1)
+            H, N = imged_beliefs.shape[:2]
+            flat_ib = imged_beliefs.reshape(H * N, -1)
+            flat_ips = imged_prior_states.reshape(H * N, -1)
+            flat_ime = imged_map_emb.reshape(H * N, -1)
 
+            # ---------------------------------------------------------------
+            #  2) 想象中的 r̂_t, ĉ_t, 风险项 χ_t (全部来自 frozen WM)
+            # ---------------------------------------------------------------
+            with FreezeParameters(model_modules):
                 imged_reward = reward_model(flat_ib, flat_ips, flat_ime).view(H, N)
-                value_pred = value_model(flat_ib, flat_ips, flat_ime).view(H, N)
                 imged_cont = continuation_model(flat_ib, flat_ips, flat_ime).view(H, N)
 
-                # [C-1 修复] 论文公式(28): 显式预测占用驱动风险感知想象
-                # obstacle_forecaster 在想象中预测未来占用场,
-                # 将高占用区域的风险注入想象奖励, 实现 risk-sensitive actor-critic.
-                #
-                # 实现细节: 想象中不持有显式 UAV 网格坐标, 无法精确计算
-                # χ_t = Ô_{t+1}(ĩ_{t+1}). 使用空间最大值作为保守上界:
-                #   χ_t ≈ max_{i,j} Ô_{t+1}(i, j)
-                # 这保证了只要任何位置有高预测占用, 风险就被惩罚.
-                # 未来可通过添加位置解码器实现位置精确的风险评估.
+                # [论文公式 28] risk-sensitive imagination — 不因换 D3QN 而丢失
                 if args.lambda_risk_imag > 0:
                     occ_pred, _ = obstacle_forecaster(flat_ib, flat_ips, flat_ime)
-                    # occ_pred: (H*N, K, Ng, Ng)
-                    # [P-2 修复] 公式(28): χ_t = max_{1≤k≤K} max_{i,j} Ô_{t+k}(i,j)
-                    # 对所有 K 步和所有空间位置取最大值 (保守上界)
-                    chi_flat = occ_pred.view(H * N, -1).max(dim=1)[0]  # (H*N,)
+                    # χ_t = max_{1≤k≤K} max_{i,j} Ô_{t+k}(i,j)
+                    chi_flat = occ_pred.view(H * N, -1).max(dim=1)[0]   # (H*N,)
                     chi = chi_flat.view(H, N)
                     imged_reward = imged_reward - args.lambda_risk_imag * chi
 
-        returns = lambda_return(
-            imged_reward, value_pred, bootstrap=value_pred[-1],
-            cont_pred=imged_cont, discount=args.discount, lambda_=args.disclam,
-        )
+            # ---------------------------------------------------------------
+            #  3) Double DQN TD 目标
+            #      y_t = r̂_t + γ · ĉ_t · Q_target(s_{t+1}, a*)
+            #      a*  = argmax_a Q_online(s_{t+1}, a)
+            #  对 t = 0..H-2 共 H-1 个 TD 目标
+            # ---------------------------------------------------------------
+            next_b = imged_beliefs[1:].reshape(-1, imged_beliefs.shape[-1])
+            next_s = imged_prior_states[1:].reshape(-1, imged_prior_states.shape[-1])
+            next_m = imged_map_emb[1:].reshape(-1, imged_map_emb.shape[-1])
 
-        # ==============================================================
-        #  [补丁 1] returns 硬截断, 防止 -mean(returns) 产生过大梯度.
-        #  位置关键: 必须在 target_return = returns.detach() 之前.
-        #  这样 actor 的 -mean(returns) 和 value 的 MSE target 都受益,
-        #  无需再在 value 侧单独 clamp (补丁3 因此可以省).
-        #  ±100 覆盖本任务奖励体系 (rg=20, 惩罚±10, step -0.01) 在
-        #  planning_horizon=5, γ=0.99, λ=0.95 下的合理 λ-return 上界.
-        # ==============================================================
-        returns = returns.clamp(-100.0, 100.0)
+            q_next_online = q_net(next_b, next_s, next_m)              # ((H-1)*N, |A|)
+            a_star = q_next_online.argmax(dim=-1, keepdim=True)        # ((H-1)*N, 1)
+            q_next_target = target_q_net(next_b, next_s, next_m).gather(1, a_star).squeeze(1)
+            q_next_target = q_next_target.view(H - 1, N)
 
-        actor_loss = -torch.mean(returns)
-        _actor_loss_val = actor_loss.item()
-        actor_optimizer.zero_grad()
-        actor_scaler.scale(actor_loss).backward()
-        actor_scaler.unscale_(actor_optimizer)
-        safe_clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
-        actor_scaler.step(actor_optimizer)
-        actor_scaler.update()
+            # TD 目标 (使用 r̂_{t+1} 对齐 Dreamer 约定: r̂_t 为进入 s_t 的奖励)
+            td_target = imged_reward[1:] + args.discount * imged_cont[1:] * q_next_target
+            # [补丁 1] 硬截断保护 (与 main.py 原 returns.clamp 一致)
+            td_target = td_target.clamp(-100.0, 100.0)
 
-        # ===============================================================
-        #  Value Training (公式 34)
-        # ===============================================================
-        with torch.no_grad():
-            value_beliefs = imged_beliefs.detach()
-            value_prior_states = imged_prior_states.detach()
-            value_map_emb = imged_map_emb.detach()
-            target_return = returns.detach()
+        # ---------------------------------------------------------------
+        #  4) Q 在线网络前向 (带梯度), 仅对 s_t, a_t 做 gather
+        # ---------------------------------------------------------------
+        cur_b = imged_beliefs[:-1].reshape(-1, imged_beliefs.shape[-1])
+        cur_s = imged_prior_states[:-1].reshape(-1, imged_prior_states.shape[-1])
+        cur_m = imged_map_emb[:-1].reshape(-1, imged_map_emb.shape[-1])
+        # 想象中实际采取的动作 (one-hot) → int index
+        cur_a_idx = imged_actions_onehot[:-1].argmax(dim=-1).reshape(-1)   # ((H-1)*N,)
 
-        del imagination_traj, imged_beliefs, imged_prior_states, imged_prior_means
-        del imged_prior_std_devs, imged_map_emb, returns
-        del actor_loss, imged_reward, imged_cont
-        # [方案A] 释放想象用的完整地图
-        if actor_maps is not None:
-            del actor_maps
-        torch.cuda.empty_cache()
-
-        flat_vb = value_beliefs.view(H * N, -1)
-        flat_vps = value_prior_states.view(H * N, -1)
-        flat_vme = value_map_emb.view(H * N, -1)
         with autocast(enabled=use_amp):
-            value_pred_train = value_model(flat_vb, flat_vps, flat_vme).view(H, N)
-            value_loss = 0.5 * F.mse_loss(value_pred_train, target_return, reduction='mean')
+            q_all = q_net(cur_b, cur_s, cur_m)                              # ((H-1)*N, |A|)
+            q_sa = q_all.gather(1, cur_a_idx.unsqueeze(1)).squeeze(1)
+            q_sa = q_sa.view(H - 1, N)
+            q_loss = F.smooth_l1_loss(q_sa, td_target, reduction='mean')
 
-        value_optimizer.zero_grad()
-        value_scaler.scale(value_loss).backward()
-        value_scaler.unscale_(value_optimizer)
-        safe_clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
-        value_scaler.step(value_optimizer)
-        value_scaler.update()
+        _q_loss_val = q_loss.item()
+        q_optimizer.zero_grad()
+        q_scaler.scale(q_loss).backward()
+        q_scaler.unscale_(q_optimizer)
+        safe_clip_grad_norm_(q_net.parameters(), args.grad_clip_norm, norm_type=2)
+        q_scaler.step(q_optimizer)
+        q_scaler.update()
 
-        _loss_items.extend([_actor_loss_val, value_loss.item()])
-        losses.append(_loss_items)  # 11 items: obs, rew, kl, cont, map, upd, occ, flow, trk, actor, value
+        # ---------------------------------------------------------------
+        #  5) Target 网络同步 (硬拷贝 / Polyak)
+        # ---------------------------------------------------------------
+        q_update_count += 1
+        if args.q_target_tau >= 1.0:
+            if q_update_count % args.q_target_update == 0:
+                sync_target(target_q_net, q_net, tau=1.0)
+        else:
+            sync_target(target_q_net, q_net, tau=args.q_target_tau)
+
+        _loss_items.append(_q_loss_val)
+        losses.append(_loss_items)  # 10 items: obs, rew, kl, cont, map, upd, occ, flow, trk, q
 
         # [OOM 修复] 彻底清理本轮迭代
-        del value_loss, value_beliefs, value_prior_states, value_map_emb, target_return
+        del imagination_traj, imged_beliefs, imged_prior_states
+        del imged_map_emb, imged_actions_onehot, imged_reward, imged_cont
+        del q_next_online, a_star, q_next_target, td_target, q_all, q_sa, q_loss
+        if start_maps is not None:
+            del start_maps
         torch.cuda.empty_cache()
 
     # ===============================================================
@@ -1133,8 +1200,8 @@ for episode in tqdm(
     # [S2 修复] 新增 trk_loss 记录
     metrics['trk_loss'] = metrics.get('trk_loss', [])
     metrics['trk_loss'].append(np.mean(losses[8]))
-    metrics['actor_loss'].append(np.mean(losses[9]))
-    metrics['value_loss'].append(np.mean(losses[10]))
+    # [D3QN 替换] actor_loss + value_loss → q_loss
+    metrics['q_loss'].append(np.mean(losses[9]))
 
     lineplot(metrics['episodes'][-len(metrics['observation_loss']):], metrics['observation_loss'], 'Observation Loss', results_dir)
     lineplot(metrics['episodes'][-len(metrics['reward_loss']):], metrics['reward_loss'], 'Reward Loss', results_dir)
@@ -1143,8 +1210,7 @@ for episode in tqdm(
     lineplot(metrics['episodes'][-len(metrics['map_loss']):], metrics['map_loss'], 'Map Loss', results_dir)
     lineplot(metrics['episodes'][-len(metrics['map_updater_loss']):], metrics['map_updater_loss'], 'MapUpdater Loss', results_dir)
     lineplot(metrics['episodes'][-len(metrics['occ_loss']):], metrics['occ_loss'], 'Occ Loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['actor_loss']):], metrics['actor_loss'], 'Actor Loss', results_dir)
-    lineplot(metrics['episodes'][-len(metrics['value_loss']):], metrics['value_loss'], 'Value Loss', results_dir)
+    lineplot(metrics['episodes'][-len(metrics['q_loss']):], metrics['q_loss'], 'Q Loss', results_dir)
 
     writer.add_scalar('Loss/observation', metrics['observation_loss'][-1], episode)
     writer.add_scalar('Loss/reward', metrics['reward_loss'][-1], episode)
@@ -1155,8 +1221,7 @@ for episode in tqdm(
     writer.add_scalar('Loss/occ', metrics['occ_loss'][-1], episode)
     writer.add_scalar('Loss/flow', metrics['flow_loss'][-1], episode)
     writer.add_scalar('Loss/trk', metrics['trk_loss'][-1], episode)
-    writer.add_scalar('Loss/actor', metrics['actor_loss'][-1], episode)
-    writer.add_scalar('Loss/value', metrics['value_loss'][-1], episode)
+    writer.add_scalar('Loss/q', metrics['q_loss'][-1], episode)
 
     # ===============================================================
     #  Evaluation — [论文 Section V-D] 完整评估指标
@@ -1164,8 +1229,8 @@ for episode in tqdm(
     if episode % args.test_interval == 0:
         for m in world_model_modules:
             m.eval()
-        actor_model.eval()
-        value_model.eval()
+        # [D3QN 替换] actor_model + value_model → q_net (target_q_net 始终 eval, 不需切换)
+        q_net.eval()
 
         # 两个评估域: in-domain (训练地图的新配置) 和 out-of-domain (held-out 地图)
         eval_results = {}
@@ -1303,6 +1368,14 @@ for episode in tqdm(
         lineplot(metrics['test_episodes'], metrics.get('test_in_domain_SR', []), 'SR_InDomain', results_dir)
         lineplot(metrics['test_episodes'], metrics.get('test_ood_SR', []), 'SR_OOD', results_dir)
         lineplot(metrics['test_episodes'], metrics.get('test_in_domain_CR', []), 'CR_InDomain', results_dir)
+        lineplot(metrics['test_episodes'], metrics.get('test_ood_CR', []), 'CR_OOD', results_dir)
+        # [补图] Reward / APLR / MinClr 在 in-domain + OOD 两域都出图
+        lineplot(metrics['test_episodes'], metrics.get('test_in_domain_Reward', []), 'Reward_InDomain', results_dir)
+        lineplot(metrics['test_episodes'], metrics.get('test_ood_Reward', []),       'Reward_OOD',       results_dir)
+        lineplot(metrics['test_episodes'], metrics.get('test_in_domain_APLR', []),   'APLR_InDomain',    results_dir)
+        lineplot(metrics['test_episodes'], metrics.get('test_ood_APLR', []),         'APLR_OOD',         results_dir)
+        lineplot(metrics['test_episodes'], metrics.get('test_in_domain_MinClr', []), 'MinClr_InDomain',  results_dir)
+        lineplot(metrics['test_episodes'], metrics.get('test_ood_MinClr', []),       'MinClr_OOD',       results_dir)
         torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
 
         # ---- [S3 修复] Occ-IoU / ADE / FDE: 障碍物预测质量 ----
@@ -1410,8 +1483,18 @@ for episode in tqdm(
 
         for m in world_model_modules:
             m.train()
-        actor_model.train()
-        value_model.train()
+        # [D3QN 替换] actor/value → q_net
+        q_net.train()
+
+    # ===============================================================
+    #  [D3QN 替换] 按 episode 线性衰减环境采集 ε
+    # ===============================================================
+    _frac = min(1.0, max(0.0, (episode - 1) / max(1, args.q_epsilon_decay_eps)))
+    _current_eps = args.q_epsilon_start + _frac * (args.q_epsilon_end - args.q_epsilon_start)
+    # update_belief_and_act 中 `explore=True` 时使用 args.action_noise 做 ε-greedy;
+    # 这里直接改写 args.action_noise 为当前 ε, 避免修改 update_belief_and_act.
+    args.action_noise = _current_eps
+    writer.add_scalar('Train/epsilon', _current_eps, episode)
 
     # ===============================================================
     #  Collect new episode
@@ -1463,15 +1546,16 @@ for episode in tqdm(
             'reward_model': reward_model.state_dict(),
             'continuation_model': continuation_model.state_dict(),
             'encoder': encoder.state_dict(),
-            'actor_model': actor_model.state_dict(),
-            'value_model': value_model.state_dict(),
+            # [D3QN 替换] actor_model + value_model → q_net + target_q_net
+            'q_net': q_net.state_dict(),
+            'target_q_net': target_q_net.state_dict(),
+            'q_update_count': q_update_count,
             'map_encoder': map_encoder.state_dict(),
             'map_transition_model': map_transition_model.state_dict(),
             'obstacle_forecaster': obstacle_forecaster.state_dict(),
             'map_updater': map_updater.state_dict(),
             'model_optimizer': model_optimizer.state_dict(),
-            'actor_optimizer': actor_optimizer.state_dict(),
-            'value_optimizer': value_optimizer.state_dict(),
+            'q_optimizer': q_optimizer.state_dict(),
         }
         if semantic_extractor is not None:
             save_dict['semantic_extractor'] = semantic_extractor.state_dict()
@@ -1503,8 +1587,8 @@ print("=" * 92)
 
 for _m in world_model_modules:
     _m.eval()
-actor_model.eval()
-value_model.eval()
+# [D3QN 替换] actor_model + value_model → q_net
+q_net.eval()
 
 # ── 1. 预测质量指标: Occ-IoU / ADE / FDE (从 replay buffer 采样) ───────────────
 _final_occ_ious, _final_ades, _final_fdes = [], [], []
