@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F   # [L2 归一化需要]
 import gymnasium as gym
 from gymnasium import spaces
 import mysql.connector
@@ -68,10 +69,13 @@ class SiameseNetwork(nn.Module):
         self.fc = nn.Linear(512, feature_dim)  # 512 → 128 (论文: 128 outputs)
 
     def forward_one(self, x):
-        """单分支: image (B,3,H,W) → 128 维特征"""
+        """单分支: image (B,3,H,W) → 128 维特征 (已 L2 归一化)"""
         x = self.backbone(x)           # (B, 512, 1, 1)
         x = x.view(x.size(0), -1)     # (B, 512)
         x = self.fc(x)                 # (B, 128)
+        # [关键] L2 归一化, 必须和训练时 (train_siamese_v2.py normalize=True) 一致.
+        # 否则推理端 df = ||f_t - f_g||_2 的分布和训练时不同, 相似度全错.
+        x = F.normalize(x, p=2, dim=1)
         return x
 
     def forward(self, x1, x2):
@@ -272,7 +276,15 @@ class UAVNavigationEnv(gym.Env):
         similarity_reward_scale=0.0,
         # --- Siamese 相似度参数 ---
         siamese_model_path=None,
-        df_max=5.0,
+        # [匹配 train_siamese_v2.py normalize=True] L2 归一化后两个单位向量的
+        # L2 距离上界是 2.0. 实际 val 集结果:
+        #   df_pos = 0.073 ± 0.058
+        #   df_neg = 1.366 ± 0.124
+        #   sep    = +1.293  (AUC = 0.9994)
+        # 中点取法 df_max = (df_pos + df_neg) / 2 ≈ 0.72
+        # 这样正对 df < df_max 给出 vs ∈ [0.80, 1.00] 的平滑信号,
+        # 负对 df > df_max 全部 clip 到 vs = 0.
+        df_max=0.72,
         siamese_device='cuda',
         # --- [论文 Section III-A] 动态障碍物参数 ---
         # 碰撞判定距离 = obstacle_rho + uav_rho

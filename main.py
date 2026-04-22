@@ -44,6 +44,29 @@ from models import (
 )
 from utils import FreezeParameters, imagine_ahead, lambda_return, lineplot, write_video
 
+
+# ============================================================================
+#  [补丁 4] NaN-safe gradient clipping
+# ----------------------------------------------------------------------------
+#  nn.utils.clip_grad_norm_ 本身对 NaN 梯度无效:
+#    total_norm = sqrt(... + NaN² + ...) = NaN
+#    clip_coef  = max_norm / NaN         = NaN
+#    grad *= NaN                         → 所有梯度全变 NaN
+#  这样 NaN 就进 Adam 的 exp_avg / exp_avg_sq, 状态永久污染, 参数下一步全烂.
+#
+#  safe 版本先用 nan_to_num_ 把每个 p.grad 里的 NaN → 0, Inf → ±1e4,
+#  保留梯度符号信息, 再调原生 clip_grad_norm_. 这样 Adam 吃到的梯度一定 finite.
+# ============================================================================
+def safe_clip_grad_norm_(parameters, max_norm, norm_type=2.0):
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = [p for p in parameters if p.grad is not None]
+    for p in parameters:
+        torch.nan_to_num_(p.grad, nan=0.0, posinf=1e4, neginf=-1e4)
+    return nn.utils.clip_grad_norm_(parameters, max_norm, norm_type=norm_type)
+
+
+
 # ============================================================================
 #  Hyperparameters
 # ============================================================================
@@ -709,7 +732,10 @@ for episode in tqdm(
                 _flat_s = posterior_states.view(T_loss * B_loss, -1)
                 cont_pred = continuation_model(_flat_b, _flat_s).view(T_loss, B_loss)
         cont_target = nonterminals[:-1].squeeze(-1)
-        continuation_loss = F.binary_cross_entropy(cont_pred.float(), cont_target, reduction='mean')
+        # [补丁 2a] BCE clamp — 防 sigmoid 输出 0.0 / 1.0 时 log(0) = -inf 污染损失.
+        # cont_pred 模型末端是 sigmoid, logits > ~16 时 fp32 下精确等于 1.0.
+        cont_pred_safe = cont_pred.float().clamp(1e-6, 1.0 - 1e-6)
+        continuation_loss = F.binary_cross_entropy(cont_pred_safe, cont_target, reduction='mean')
 
         # --- [公式 39] L_dyn + L_rep: 非对称 KL 损失 ---
         dist_post = Normal(posterior_means, posterior_std_devs)
@@ -859,8 +885,11 @@ for episode in tqdm(
                 _mask_occ = _mask.unsqueeze(-1).unsqueeze(-1)          # (batch, K, 1, 1)
 
                 # --- L_occ (公式41) ---
+                # [补丁 2b] BCE clamp — 同上. obstacle_forecaster 末端 sigmoid
+                # 在极端 logits 下精确吐 0.0 / 1.0, log(0) = -inf 污染 L_occ.
+                _occ_p_safe = _occ_p.float().clamp(1e-6, 1.0 - 1e-6)
                 _occ_elem = F.binary_cross_entropy(
-                    _occ_p.float(), _gt_occ.clamp(0, 1), reduction='none'
+                    _occ_p_safe, _gt_occ.clamp(0, 1), reduction='none'
                 )
                 _occ_loss = _occ_loss + (_occ_elem * _mask_occ).sum()
                 _occ_count = _occ_count + _mask_occ.expand_as(_occ_elem).sum()
@@ -936,7 +965,7 @@ for episode in tqdm(
         # 在累积周期末步执行 step
         if (s + 1) % args.grad_accumulate == 0 or (s + 1) == args.collect_interval:
             model_scaler.unscale_(model_optimizer)
-            nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
+            safe_clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
             model_scaler.step(model_optimizer)
             model_scaler.update()
 
@@ -1031,12 +1060,22 @@ for episode in tqdm(
             cont_pred=imged_cont, discount=args.discount, lambda_=args.disclam,
         )
 
+        # ==============================================================
+        #  [补丁 1] returns 硬截断, 防止 -mean(returns) 产生过大梯度.
+        #  位置关键: 必须在 target_return = returns.detach() 之前.
+        #  这样 actor 的 -mean(returns) 和 value 的 MSE target 都受益,
+        #  无需再在 value 侧单独 clamp (补丁3 因此可以省).
+        #  ±100 覆盖本任务奖励体系 (rg=20, 惩罚±10, step -0.01) 在
+        #  planning_horizon=5, γ=0.99, λ=0.95 下的合理 λ-return 上界.
+        # ==============================================================
+        returns = returns.clamp(-100.0, 100.0)
+
         actor_loss = -torch.mean(returns)
         _actor_loss_val = actor_loss.item()
         actor_optimizer.zero_grad()
         actor_scaler.scale(actor_loss).backward()
         actor_scaler.unscale_(actor_optimizer)
-        nn.utils.clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
+        safe_clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
         actor_scaler.step(actor_optimizer)
         actor_scaler.update()
 
@@ -1067,7 +1106,7 @@ for episode in tqdm(
         value_optimizer.zero_grad()
         value_scaler.scale(value_loss).backward()
         value_scaler.unscale_(value_optimizer)
-        nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
+        safe_clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
         value_scaler.step(value_optimizer)
         value_scaler.update()
 
