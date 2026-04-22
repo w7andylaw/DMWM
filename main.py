@@ -58,7 +58,7 @@ parser.add_argument(
 )
 parser.add_argument('--symbolic-env', action='store_true', help='Symbolic features')
 parser.add_argument('--max-episode-length', type=int, default=1000, metavar='T')
-parser.add_argument('--experience-size', type=int, default=500000, metavar='D',
+parser.add_argument('--experience-size', type=int, default=1000000, metavar='D',
                     help='Experience replay size')
 parser.add_argument('--cnn-activation-function', type=str, default='relu', choices=dir(F))
 parser.add_argument('--dense-activation-function', type=str, default='elu', choices=dir(F))
@@ -69,7 +69,7 @@ parser.add_argument('--state-size', type=int, default=30, metavar='Z')
 parser.add_argument('--semantic-size', type=int, default=512, metavar='S', help='Semantic feature size (gθ output)')
 parser.add_argument('--map-embedding-size', type=int, default=256, metavar='M', help='Map embedding size (E_m output)')
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R')
-parser.add_argument('--action-noise', type=float, default=0.15, metavar='ε')
+parser.add_argument('--action-noise', type=float, default=0.2, metavar='ε')
 parser.add_argument('--episodes', type=int, default=1000, metavar='E')
 parser.add_argument('--seed-episodes', type=int, default=5, metavar='S')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C')
@@ -90,7 +90,7 @@ parser.add_argument('--actor-learning-rate', type=float, default=8e-5, metavar='
 parser.add_argument('--value-learning-rate', type=float, default=8e-5, metavar='α')
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS')
 parser.add_argument('--adam-epsilon', type=float, default=1e-7, metavar='ε')
-parser.add_argument('--grad-clip-norm', type=float, default=10.0, metavar='C')
+parser.add_argument('--grad-clip-norm', type=float, default=100.0, metavar='C')
 parser.add_argument('--planning-horizon', type=int, default=5, metavar='H',
                     help='Planning horizon for imagination (default 10 for 6GB GPU)')
 parser.add_argument('--discount', type=float, default=0.99, metavar='H')
@@ -1236,10 +1236,17 @@ for episode in tqdm(
             writer.add_scalar(f'Eval/{eval_mode}_MinClr', min_clr, current_training_steps)
             writer.add_scalar(f'Eval/{eval_mode}_Reward', avg_reward, current_training_steps)
 
+        # [Average Test Rewards] 跨 in-domain + OOD 的平均测试奖励 — 便于在
+        # TensorBoard 中监控整体测试表现的趋势.
+        _avg_test_reward = float(np.mean([eval_results[m]['Reward'] for m in eval_results]))
+        writer.add_scalar('Eval/Average_Test_Rewards', _avg_test_reward,
+                          metrics['steps'][-1] if len(metrics['steps']) > 0 else 0)
+
         # 打印
         for mode, res in eval_results.items():
             print(f"  [{mode}] SR={res['SR']:.1f}% CR={res['CR']:.1f}% "
                   f"APLR={res['APLR']:.2f} MinClr={res['MinClr']:.0f} Reward={res['Reward']:.1f}")
+        print(f"  [Average Test Rewards] {_avg_test_reward:.1f}")
 
         # 保存到 metrics
         metrics['test_episodes'].append(episode)
@@ -1432,5 +1439,338 @@ for episode in tqdm(
         torch.save(save_dict, os.path.join(results_dir, 'models_%d.pth' % episode))
         if args.checkpoint_experience:
             torch.save(D, os.path.join(results_dir, 'experience.pth'))
+
+
+# ============================================================================
+#  POST-TRAINING FINAL EVALUATION
+#  ----------------------------------------------------------------------------
+#  训练完全结束后:
+#    1. 在 in-domain 和 OOD 两个域各运行 args.test_episodes 个测试集,
+#       逐集记录: SR / APLR / CR / MinClr / Reward.
+#    2. 从经验回放缓冲区采样, 计算 Occ-IoU / ADE / FDE (全局预测质量).
+#    3. 控制台打印论文 Table I 风格表格:
+#         SR (%)↑  APLR↓  CR (%)↓  MinClr↑  Occ-IoU↑  ADE↓  FDE↓
+#         SR-OOD (%)↑  CR-OOD (%)↓
+#       并逐集输出每一集的指标, 最后给出平均行.
+#    4. TensorBoard 写入:
+#         FinalTest/ep{i}_<mode>_<metric>  — 每集
+#         FinalTest/Average_<metric>        — 平均 (论文 Table I 使用)
+#         FinalTest/Average_Test_Rewards    — 跨全部测试集的平均奖励
+# ============================================================================
+
+print("\n" + "=" * 92)
+print(" " * 26 + "POST-TRAINING FINAL EVALUATION")
+print("=" * 92)
+
+for _m in world_model_modules:
+    _m.eval()
+actor_model.eval()
+value_model.eval()
+
+# ── 1. 预测质量指标: Occ-IoU / ADE / FDE (从 replay buffer 采样) ───────────────
+_final_occ_ious, _final_ades, _final_fdes = [], [], []
+with torch.no_grad():
+    for _ in range(min(10, max(1, D.episodes))):
+        try:
+            _obs_f, _act_f, _rew_f, _nt_f = D.sample(
+                min(4, args.batch_size), min(20, args.chunk_size)
+            )
+        except Exception:
+            break
+        if not isinstance(_obs_f, dict) or 'semantic_map' not in _obs_f:
+            break
+
+        _dev_f = args.device
+        _sem_f = _obs_f['semantic_map'].float().to(_dev_f)
+        _T_f, _B_f = _sem_f.shape[:2]
+        _K_f = args.forecast_horizon
+        _TB_f = _T_f * _B_f
+
+        _img_f = _obs_f['image'].float().to(_dev_f)
+        _tgt_f = _obs_f['target'].float().to(_dev_f)
+        _pos_f = _obs_f['position'].float().to(_dev_f)
+        _saf_f = (_obs_f['safety_mask'].float().to(_dev_f).view(_TB_f, -1)
+                  if 'safety_mask' in _obs_f else None)
+
+        _enc_f = encoder(
+            _img_f.view(_TB_f, *_img_f.shape[2:]),
+            _tgt_f.view(_TB_f, *_tgt_f.shape[2:]),
+            _pos_f.view(_TB_f, -1),
+            safety_mask=_saf_f,
+        )
+        _flat_emb_f = _enc_f[0] if isinstance(_enc_f, tuple) else _enc_f
+        _embed_f = _flat_emb_f.view(_T_f, _B_f, -1)[1:]
+
+        _flat_me_f = map_encoder(_sem_f.view(_TB_f, *_sem_f.shape[2:])).view(_T_f, _B_f, -1)
+        _me_tm_f, _me_post_f = _flat_me_f[:-1], _flat_me_f[1:]
+
+        _init_b_f = torch.zeros(_B_f, args.belief_size, device=_dev_f)
+        _init_s_f = torch.zeros(_B_f, args.state_size, device=_dev_f)
+        _tm_f = transition_model(
+            _init_s_f, _act_f[:-1].to(_dev_f), _init_b_f, _embed_f,
+            _nt_f[:-1].to(_dev_f),
+            map_embeddings=_me_tm_f, map_embeddings_post=_me_post_f,
+        )
+        _beliefs_f, _poststates_f = _tm_f[0], _tm_f[4]
+        _T_loss_f = _beliefs_f.shape[0]
+
+        _gy, _gx = torch.meshgrid(
+            torch.arange(30, device=_dev_f, dtype=torch.float32),
+            torch.arange(30, device=_dev_f, dtype=torch.float32), indexing='ij')
+        _coords_f = torch.stack([_gx.reshape(-1), _gy.reshape(-1)], dim=-1)
+
+        for ti in range(0, max(1, _T_loss_f - _K_f)):
+            _occ_p, _ = obstacle_forecaster(
+                _beliefs_f[ti], _poststates_f[ti], _me_post_f[ti]
+            )
+            for k in range(_K_f):
+                fut = ti + k + 1
+                if fut >= _T_loss_f:
+                    break
+                gt_occ = _sem_f[fut + 1, :, 3, :, :].float()
+                pred_occ = _occ_p[:, k]
+
+                gt_bin = (gt_occ > 0.3).float()
+                pr_bin = (pred_occ > 0.3).float()
+                inter = (gt_bin * pr_bin).sum(dim=(1, 2))
+                union = ((gt_bin + pr_bin) > 0).float().sum(dim=(1, 2))
+                _final_occ_ious.append((inter / union.clamp(min=1)).mean().item())
+
+                gt_w = gt_occ.reshape(_B_f, -1).softmax(dim=-1)
+                pr_w = pred_occ.reshape(_B_f, -1).softmax(dim=-1)
+                disp = torch.norm(
+                    torch.matmul(gt_w, _coords_f) - torch.matmul(pr_w, _coords_f),
+                    dim=-1
+                ).mean().item()
+                _final_ades.append(disp)
+                if k == _K_f - 1:
+                    _final_fdes.append(disp)
+
+        del _img_f, _tgt_f, _pos_f, _sem_f, _flat_emb_f, _embed_f
+        del _flat_me_f, _beliefs_f, _poststates_f, _tm_f
+        torch.cuda.empty_cache()
+
+final_occ_iou = float(np.mean(_final_occ_ious)) if _final_occ_ious else 0.0
+final_ade = float(np.mean(_final_ades)) if _final_ades else 0.0
+final_fde = float(np.mean(_final_fdes)) if _final_fdes else 0.0
+
+# ── 2. 在 in-domain 和 OOD 运行全部测试集, 记录每集的导航指标 ───────────────
+_final_eval_results = {}   # {mode: [per-episode dict, ...]}
+
+for _eval_mode, _eval_seed, _is_ood in [('in_domain', 42, False), ('ood', 9999, True)]:
+    _per_ep_records = []
+    with torch.no_grad():
+        for _tep in range(args.test_episodes):
+            observation = env.reset(map_seed=_eval_seed + _tep, ood=_is_ood)
+            belief = torch.zeros(1, args.belief_size, device=args.device)
+            posterior_state = torch.zeros(1, args.state_size, device=args.device)
+            map_emb = torch.zeros(1, args.map_embedding_size, device=args.device)
+            prev_map = None
+            action = torch.zeros(1, env.action_size, device=args.device)
+            done = False
+
+            path_length = 0.0
+            min_clearance = float('inf')
+            ep_reward = 0.0
+            reached, collided = False, False
+
+            _inner_env = env._env if hasattr(env, '_env') else env
+            start_pos = (_inner_env.agent_pos.copy()
+                         if hasattr(_inner_env, 'agent_pos') else None)
+
+            while not done:
+                (belief, posterior_state, map_emb, prev_map,
+                 action, next_observation, reward, done) = update_belief_and_act(
+                    args, env, planner, transition_model, encoder,
+                    belief, posterior_state, action, observation,
+                    map_encoder=map_encoder,
+                    current_map_embedding=map_emb,
+                    map_updater=map_updater, prev_map=prev_map,
+                    explore=False,
+                )
+                r_val = reward.item() if torch.is_tensor(reward) else float(reward)
+                ep_reward += r_val
+                path_length += 1.0
+
+                if hasattr(_inner_env, 'obstacles') and hasattr(_inner_env, 'agent_pos'):
+                    for _obs_j in _inner_env.obstacles:
+                        _d = float(np.linalg.norm(_inner_env.agent_pos - _obs_j.q))
+                        if _d < min_clearance:
+                            min_clearance = _d
+
+                _info = getattr(_inner_env, '_last_info', {}) or {}
+                if not _info:
+                    _rt = getattr(_inner_env, 'reward_reach', 100.0)
+                    _rc = getattr(_inner_env, 'reward_collision', -10.0)
+                    if r_val >= _rt * 0.9:
+                        _info = {'reach': True}
+                    if r_val <= _rc * 0.9:
+                        _info['collision'] = True
+                if _info.get('reach', False):
+                    reached = True
+                if _info.get('collision', False):
+                    collided = True
+                observation = next_observation
+
+            # 单集 APLR: 到达时为 路径步数 / 最短切比雪夫距离, 未到达记 NaN 并从均值中剔除
+            ep_aplr = float('nan')
+            if reached and start_pos is not None and hasattr(_inner_env, 'target_pos'):
+                _tgt = _inner_env.target_pos
+                _shortest = max(abs(start_pos[0] - _tgt[0]),
+                                abs(start_pos[1] - _tgt[1])) / _inner_env.cell_size
+                if _shortest > 0:
+                    ep_aplr = path_length / _shortest
+
+            _per_ep_records.append({
+                'SR':     100.0 if reached else 0.0,
+                'CR':     100.0 if collided else 0.0,
+                'APLR':   ep_aplr,
+                'MinClr': (min_clearance if min_clearance < float('inf') else 0.0),
+                'Reward': ep_reward,
+            })
+    _final_eval_results[_eval_mode] = _per_ep_records
+
+# ── 3. 打印论文 Table I 风格表格 ─────────────────────────────────────────────
+_col = "{:>4} {:>8} {:>8} {:>8} {:>10} {:>10} {:>8} {:>8} {:>10}"
+
+def _fmt(v, spec):
+    """NaN 显示为 ' - '."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "   -   "
+    return spec.format(v)
+
+print("\n" + "-" * 92)
+print(" In-Domain test episodes (SR-in / APLR / CR-in / MinClr)")
+print("-" * 92)
+print(_col.format("Ep", "SR(%)", "APLR", "CR(%)", "MinClr",
+                  "Occ-IoU", "ADE", "FDE", "Reward"))
+for _i, _rec in enumerate(_final_eval_results['in_domain'], 1):
+    print(_col.format(
+        _i,
+        _fmt(_rec['SR'],     "{:8.1f}"),
+        _fmt(_rec['APLR'],   "{:8.3f}"),
+        _fmt(_rec['CR'],     "{:8.1f}"),
+        _fmt(_rec['MinClr'], "{:10.1f}"),
+        _fmt(final_occ_iou,  "{:10.3f}"),
+        _fmt(final_ade,      "{:8.2f}"),
+        _fmt(final_fde,      "{:8.2f}"),
+        _fmt(_rec['Reward'], "{:10.1f}"),
+    ))
+
+print("-" * 92)
+print(" OOD test episodes (SR-OOD / APLR / CR-OOD / MinClr)")
+print("-" * 92)
+print(_col.format("Ep", "SR(%)", "APLR", "CR(%)", "MinClr",
+                  "Occ-IoU", "ADE", "FDE", "Reward"))
+for _i, _rec in enumerate(_final_eval_results['ood'], 1):
+    print(_col.format(
+        _i,
+        _fmt(_rec['SR'],     "{:8.1f}"),
+        _fmt(_rec['APLR'],   "{:8.3f}"),
+        _fmt(_rec['CR'],     "{:8.1f}"),
+        _fmt(_rec['MinClr'], "{:10.1f}"),
+        _fmt(final_occ_iou,  "{:10.3f}"),
+        _fmt(final_ade,      "{:8.2f}"),
+        _fmt(final_fde,      "{:8.2f}"),
+        _fmt(_rec['Reward'], "{:10.1f}"),
+    ))
+
+# ── 4. 汇总: 论文 Table I 的一行 ─────────────────────────────────────────────
+def _mean_ignore_nan(vals):
+    vs = [v for v in vals if v is not None and not (isinstance(v, float) and np.isnan(v))]
+    return float(np.mean(vs)) if vs else 0.0
+
+_id_recs = _final_eval_results['in_domain']
+_od_recs = _final_eval_results['ood']
+
+avg_SR      = _mean_ignore_nan([r['SR']     for r in _id_recs])
+avg_APLR    = _mean_ignore_nan([r['APLR']   for r in _id_recs])
+avg_CR      = _mean_ignore_nan([r['CR']     for r in _id_recs])
+avg_MinClr  = _mean_ignore_nan([r['MinClr'] for r in _id_recs])
+avg_SR_OOD  = _mean_ignore_nan([r['SR']     for r in _od_recs])
+avg_CR_OOD  = _mean_ignore_nan([r['CR']     for r in _od_recs])
+avg_Rew_ID  = _mean_ignore_nan([r['Reward'] for r in _id_recs])
+avg_Rew_OD  = _mean_ignore_nan([r['Reward'] for r in _od_recs])
+avg_Rew_all = _mean_ignore_nan([r['Reward'] for r in _id_recs + _od_recs])
+
+print("\n" + "=" * 92)
+print(" Paper Table I — Averaged over all test episodes")
+print("=" * 92)
+print("  SR (%)↑          = {:>7.2f}".format(avg_SR))
+print("  APLR↓            = {:>7.3f}".format(avg_APLR))
+print("  CR (%)↓          = {:>7.2f}".format(avg_CR))
+print("  MinClr↑          = {:>7.2f}".format(avg_MinClr))
+print("  Occ-IoU↑         = {:>7.3f}".format(final_occ_iou))
+print("  ADE↓             = {:>7.2f}".format(final_ade))
+print("  FDE↓             = {:>7.2f}".format(final_fde))
+print("  SR-OOD (%)↑      = {:>7.2f}".format(avg_SR_OOD))
+print("  CR-OOD (%)↓      = {:>7.2f}".format(avg_CR_OOD))
+print("  --------------------------------")
+print("  Avg Test Reward (In-Domain)  = {:>7.2f}".format(avg_Rew_ID))
+print("  Avg Test Reward (OOD)        = {:>7.2f}".format(avg_Rew_OD))
+print("  Average Test Rewards (all)   = {:>7.2f}".format(avg_Rew_all))
+print("=" * 92)
+
+# ── 5. TensorBoard 写入 ──────────────────────────────────────────────────────
+_final_step = metrics['steps'][-1] if len(metrics['steps']) > 0 else args.episodes
+
+# 5a. 每集逐项写入 — 'FinalTest/ep{i}/<mode>_<metric>'
+for _mode_name in ['in_domain', 'ood']:
+    for _i, _rec in enumerate(_final_eval_results[_mode_name], 1):
+        for _k, _v in _rec.items():
+            if _v is None or (isinstance(_v, float) and np.isnan(_v)):
+                continue
+            writer.add_scalar(f'FinalTest/{_mode_name}_ep{_i}_{_k}', float(_v), _final_step)
+
+# 5b. 按论文 Table I 列写入平均值 (全部标在同一个 step 上, 方便对照)
+writer.add_scalar('FinalTest/Average_SR',       avg_SR,      _final_step)
+writer.add_scalar('FinalTest/Average_APLR',     avg_APLR,    _final_step)
+writer.add_scalar('FinalTest/Average_CR',       avg_CR,      _final_step)
+writer.add_scalar('FinalTest/Average_MinClr',   avg_MinClr,  _final_step)
+writer.add_scalar('FinalTest/Average_Occ_IoU',  final_occ_iou, _final_step)
+writer.add_scalar('FinalTest/Average_ADE',      final_ade,   _final_step)
+writer.add_scalar('FinalTest/Average_FDE',      final_fde,   _final_step)
+writer.add_scalar('FinalTest/Average_SR_OOD',   avg_SR_OOD,  _final_step)
+writer.add_scalar('FinalTest/Average_CR_OOD',   avg_CR_OOD,  _final_step)
+
+# 5c. 用户指定的 summary: "Average Test Rewards"
+writer.add_scalar('FinalTest/Average_Test_Rewards',          avg_Rew_all, _final_step)
+writer.add_scalar('FinalTest/Average_Test_Rewards_InDomain', avg_Rew_ID,  _final_step)
+writer.add_scalar('FinalTest/Average_Test_Rewards_OOD',      avg_Rew_OD,  _final_step)
+
+# 5d. 将论文 Table I 的一行也写入 TensorBoard 的 text 面板, 方便直接复制
+_table_text = (
+    "| SR (%)↑ | APLR↓ | CR (%)↓ | MinClr↑ | Occ-IoU↑ | ADE↓ | FDE↓ | SR-OOD (%)↑ | CR-OOD (%)↓ |\n"
+    "|---------|-------|---------|---------|----------|------|------|-------------|-------------|\n"
+    f"| {avg_SR:.2f}   | {avg_APLR:.3f} | {avg_CR:.2f}   "
+    f"| {avg_MinClr:.2f}   | {final_occ_iou:.3f}    | {final_ade:.2f} | {final_fde:.2f} "
+    f"| {avg_SR_OOD:.2f}       | {avg_CR_OOD:.2f}       |"
+)
+try:
+    writer.add_text('FinalTest/PaperTableI', _table_text, _final_step)
+except Exception as _e:
+    print(f"  [warn] writer.add_text failed: {_e}")
+
+# 5e. 持久化到 metrics.pth
+metrics['final_eval'] = {
+    'in_domain':              _final_eval_results['in_domain'],
+    'ood':                    _final_eval_results['ood'],
+    'avg_SR':                 avg_SR,
+    'avg_APLR':               avg_APLR,
+    'avg_CR':                 avg_CR,
+    'avg_MinClr':             avg_MinClr,
+    'occ_iou':                final_occ_iou,
+    'ade':                    final_ade,
+    'fde':                    final_fde,
+    'avg_SR_OOD':             avg_SR_OOD,
+    'avg_CR_OOD':             avg_CR_OOD,
+    'avg_test_rewards':       avg_Rew_all,
+    'avg_test_rewards_id':    avg_Rew_ID,
+    'avg_test_rewards_ood':   avg_Rew_OD,
+}
+torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
+
+writer.flush()
+writer.close()
 
 env.close()

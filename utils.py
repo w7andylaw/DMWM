@@ -94,6 +94,18 @@ def imagine_ahead(
     current_map = prev_semantic_map
 
     for t in range(planning_horizon):
+        # ============================================================
+        # [防线 4] sanitize 想象循环的状态输入 — 切断 NaN 污染链路
+        # ------------------------------------------------------------
+        # 上游任一环节产生 NaN (map_transition / map_encoder / 前一步
+        # GRU), 会通过 current_* 传到 actor (导致 logits NaN, Categorical
+        # 构造失败) 和下一步 transition_model (产生更多 NaN).
+        # 每步入口统一清理, 确保下游模块永远拿到 finite 输入.
+        # ============================================================
+        current_belief        = torch.nan_to_num(current_belief,        nan=0.0, posinf=50.0, neginf=-50.0)
+        current_state         = torch.nan_to_num(current_state,         nan=0.0, posinf=20.0, neginf=-20.0)
+        current_map_embedding = torch.nan_to_num(current_map_embedding, nan=0.0, posinf=50.0, neginf=-50.0)
+
         # [公式 29] 动作选择
         _action = policy.get_action(current_belief, current_state, current_map_embedding)
         actions[t] = _action

@@ -620,7 +620,9 @@ class TransitionModel(nn.Module):
             # [公式 15] Prior: p(z_{t+1} | h_{t+1})
             hidden = self.act_fn(self.fc_embed_belief_prior(beliefs[t + 1]))
             prior_means[t + 1], _prior_std_dev = torch.chunk(self.fc_state_prior(hidden), 2, dim=1)
-            prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + self.min_std_dev
+            # [防线 3] std 上界 clamp — 防止 softplus 无上界导致想象中 state 采样爆炸
+            # 下界 min_std_dev (通常 0.1) 已保证数值稳定, 上界 5.0 保留足够不确定性表达
+            prior_std_devs[t + 1] = (F.softplus(_prior_std_dev) + self.min_std_dev).clamp(max=5.0)
             prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
 
             # [公式 16] Posterior: q(z_{t+1} | h_{t+1}, e_{t+1}, m_{t+1})
@@ -638,7 +640,8 @@ class TransitionModel(nn.Module):
                     )
                 )
                 posterior_means[t + 1], _posterior_std_dev = torch.chunk(self.fc_state_posterior(hidden), 2, dim=1)
-                posterior_std_devs[t + 1] = F.softplus(_posterior_std_dev) + self.min_std_dev
+                # [防线 3] posterior std 同样加上界, 对称处理
+                posterior_std_devs[t + 1] = (F.softplus(_posterior_std_dev) + self.min_std_dev).clamp(max=5.0)
                 posterior_states[t + 1] = (
                     posterior_means[t + 1] + posterior_std_devs[t + 1] * torch.randn_like(posterior_means[t + 1])
                 )
